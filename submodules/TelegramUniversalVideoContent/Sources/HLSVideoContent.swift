@@ -277,8 +277,8 @@ private final class HLSVideoContentNode: ASDisplayNode, UniversalVideoContentNod
     
     private let imageNode: TransformImageNode
     
-    private var playerItem: AVPlayerItem?
-    private var player: AVPlayer?
+    private let hlsPlayerCore = HLSPlayerCore()
+    private lazy var player: Playback = hlsPlayerCore.playbackController
     private let playerNode: ASDisplayNode
     
     private var loadProgressDisposable: Disposable?
@@ -301,6 +301,7 @@ private final class HLSVideoContentNode: ASDisplayNode, UniversalVideoContentNod
     private var statusTimer: Foundation.Timer?
     
     private var preferredVideoQuality: UniversalVideoContentVideoQuality = .auto
+    private var timestampObservation: Cancellable?
     
     init(accountId: AccountRecordId, postbox: Postbox, audioSessionManager: ManagedAudioSession, userLocation: MediaResourceUserLocation, fileReference: FileMediaReference, streamVideo: Bool, loopVideo: Bool, enableSound: Bool, baseRate: Double, fetchAutomatically: Bool) {
         self.postbox = postbox
@@ -324,24 +325,20 @@ private final class HLSVideoContentNode: ASDisplayNode, UniversalVideoContentNod
         }
         
         self.imageNode = TransformImageNode()
-        
-        var player: AVPlayer?
-        player = AVPlayer(playerItem: nil)
-        self.player = player
-        if #available(iOS 16.0, *) {
-            player?.defaultRate = Float(baseRate)
-        }
+    
         if !enableSound {
-            player?.volume = 0.0
+            hlsPlayerCore.playbackController.volume = 0.0
         }
         
+        let view = hlsPlayerCore.view
         self.playerNode = ASDisplayNode()
-        self.playerNode.setLayerBlock({
-            return AVPlayerLayer(player: player)
-        })
-        
+        playerNode.setViewBlock {
+            view
+        }
+
         self.intrinsicDimensions = fileReference.media.dimensions?.cgSize ?? CGSize(width: 480.0, height: 320.0)
         
+        view.frame = CGRect(origin: CGPoint(), size: self.intrinsicDimensions)
         self.playerNode.frame = CGRect(origin: CGPoint(), size: self.intrinsicDimensions)
         
         var qualityFiles: [Int: FileMediaReference] = [:]
@@ -405,58 +402,38 @@ private final class HLSVideoContentNode: ASDisplayNode, UniversalVideoContentNod
         
         self.addSubnode(self.imageNode)
         self.addSubnode(self.playerNode)
-        self.player?.actionAtItemEnd = .pause
         
         self.imageNode.imageUpdated = { [weak self] _ in
             self?._ready.set(.single(Void()))
         }
         
-        self.player?.addObserver(self, forKeyPath: "rate", options: [], context: nil)
+        //self.player?.addObserver(self, forKeyPath: "rate", options: [], context: nil)
         
         self._bufferingStatus.set(.single(nil))
-        
-        if let playerSource = self.playerSource {
-            self.serverDisposable = SharedHLSServer.shared.registerPlayer(source: playerSource, completion: { [weak self] in
-                Queue.mainQueue().async {
-                    guard let self else {
-                        return
-                    }
-                    
-                    let playerItem: AVPlayerItem
-                    let assetUrl = "http://127.0.0.1:\(SharedHLSServer.shared.port)/\(playerSource.id)/master.m3u8"
-                    #if DEBUG
-                    print("HLSVideoContentNode: playing \(assetUrl)")
-                    #endif
-                    playerItem = AVPlayerItem(url: URL(string: assetUrl)!)
-                    
-                    if #available(iOS 14.0, *) {
-                        playerItem.startsOnFirstEligibleVariant = true
-                    }
-                    
-                    self.setPlayerItem(playerItem)
-                }
-            })
+        self.timestampObservation = player.playTimeSignal.sink { [unowned self] _ in
+            updateStatus()
         }
+
         
-        self.didBecomeActiveObserver = NotificationCenter.default.addObserver(forName: UIApplication.willEnterForegroundNotification, object: nil, queue: nil, using: { [weak self] _ in
-            guard let strongSelf = self, let layer = strongSelf.playerNode.layer as? AVPlayerLayer else {
-                return
-            }
-            layer.player = strongSelf.player
-        })
-        self.willResignActiveObserver = NotificationCenter.default.addObserver(forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: nil, using: { [weak self] _ in
-            guard let strongSelf = self, let layer = strongSelf.playerNode.layer as? AVPlayerLayer else {
-                return
-            }
-            layer.player = nil
-        })
+// TODO: fix lifecycle
+//        self.didBecomeActiveObserver = NotificationCenter.default.addObserver(forName: UIApplication.willEnterForegroundNotification, object: nil, queue: nil, using: { [weak self] _ in
+//            guard let strongSelf = self, let layer = strongSelf.playerNode.layer as? AVPlayerLayer else {
+//                return
+//            }
+//
+//            layer.player = strongSelf.player
+//        })
+//        self.willResignActiveObserver = NotificationCenter.default.addObserver(forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: nil, using: { [weak self] _ in
+//            guard let strongSelf = self, let layer = strongSelf.playerNode.layer as? AVPlayerLayer else {
+//                return
+//            }
+//            layer.player = nil
+//        })
     }
     
     deinit {
-        self.player?.removeObserver(self, forKeyPath: "rate")
-        
-        self.setPlayerItem(nil)
-        
+        self.player.pause()
+
         self.audioSessionDisposable.dispose()
         
         self.loadProgressDisposable?.dispose()
@@ -484,6 +461,7 @@ private final class HLSVideoContentNode: ASDisplayNode, UniversalVideoContentNod
         self.statusTimer?.invalidate()
     }
     
+    /*
     private func setPlayerItem(_ item: AVPlayerItem?) {
         if let playerItem = self.playerItem {
             playerItem.removeObserver(self, forKeyPath: "playbackBufferEmpty")
@@ -551,25 +529,31 @@ private final class HLSVideoContentNode: ASDisplayNode, UniversalVideoContentNod
         }
         
         self.player?.replaceCurrentItem(with: self.playerItem)
-    }
+    }*/
     
     private func updateStatus() {
-        guard let player = self.player else {
-            return
-        }
-        let isPlaying = !player.rate.isZero
+        let isPlaying = player.isPlaying
         let status: MediaPlayerPlaybackStatus
         if self.isBuffering {
             status = .buffering(initial: false, whilePlaying: isPlaying, progress: 0.0, display: true)
         } else {
             status = isPlaying ? .playing : .paused
         }
-        var timestamp = player.currentTime().seconds
+        var timestamp = player.currentTime
         if timestamp.isFinite && !timestamp.isNaN {
         } else {
             timestamp = 0.0
         }
-        self.statusValue = MediaPlayerStatus(generationTimestamp: CACurrentMediaTime(), duration: Double(self.approximateDuration), dimensions: CGSize(), timestamp: timestamp, baseRate: self.baseRate, seekId: self.seekId, status: status, soundEnabled: true)
+        self.statusValue = MediaPlayerStatus(
+            generationTimestamp: CACurrentMediaTime(),
+            duration: player.duration,
+            dimensions: CGSize(),
+            timestamp: timestamp,
+            baseRate: self.baseRate,
+            seekId: self.seekId,
+            status: status,
+            soundEnabled: true
+        )
         self._status.set(self.statusValue)
         
         if case .playing = status {
@@ -589,11 +573,9 @@ private final class HLSVideoContentNode: ASDisplayNode, UniversalVideoContentNod
     
     override func observeValue(forKeyPath keyPath: String?, of object: Any?, change: [NSKeyValueChangeKey : Any]?, context: UnsafeMutableRawPointer?) {
         if keyPath == "rate" {
-            if let player = self.player {
-                let isPlaying = !player.rate.isZero
-                if isPlaying {
-                    self.isBuffering = false
-                }
+            let isPlaying = player.isPlaying
+            if isPlaying {
+                self.isBuffering = false
             }
             self.updateStatus()
         } else if keyPath == "playbackBufferEmpty" {
@@ -603,9 +585,9 @@ private final class HLSVideoContentNode: ASDisplayNode, UniversalVideoContentNod
             self.isBuffering = false
             self.updateStatus()
         } else if keyPath == "presentationSize" {
-            if let currentItem = self.player?.currentItem {
-                print("Presentation size: \(Int(currentItem.presentationSize.height))")
-            }
+//            if let currentItem = self.player?.currentItem {
+//                print("Presentation size: \(Int(currentItem.presentationSize.height))")
+//            }
         }
     }
     
@@ -633,45 +615,45 @@ private final class HLSVideoContentNode: ASDisplayNode, UniversalVideoContentNod
         assert(Queue.mainQueue().isCurrent())
         if !self.initializedStatus {
             self._status.set(MediaPlayerStatus(generationTimestamp: 0.0, duration: Double(self.approximateDuration), dimensions: CGSize(), timestamp: 0.0, baseRate: self.baseRate, seekId: self.seekId, status: .buffering(initial: true, whilePlaying: true, progress: 0.0, display: true), soundEnabled: true))
+            // TODO: Integrate with TelegramAppDTO
+            // HLS-video-example
+            let url = URL(string: "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8")!
+            player.load(url: url)
         }
         if !self.hasAudioSession {
-            if self.player?.volume != 0.0 {
+            if self.player.volume != 0.0 {
                 self.audioSessionDisposable.set(self.audioSessionManager.push(audioSessionType: .play(mixWithOthers: false), activate: { [weak self] _ in
                     guard let self else {
                         return
                     }
                     self.hasAudioSession = true
-                    self.player?.play()
+                    self.player.play()
                 }, deactivate: { [weak self] _ in
                     guard let self else {
                         return .complete()
                     }
                     self.hasAudioSession = false
-                    self.player?.pause()
+                    self.player.pause()
                     
                     return .complete()
                 }))
             } else {
-                self.player?.play()
+                self.player.play()
             }
         } else {
-            self.player?.play()
+            self.player.play()
         }
     }
     
     func pause() {
         assert(Queue.mainQueue().isCurrent())
-        self.player?.pause()
+        self.player.pause()
     }
     
     func togglePlayPause() {
         assert(Queue.mainQueue().isCurrent())
-        
-        guard let player = self.player else {
-            return
-        }
-        
-        if player.rate.isZero {
+
+        if !player.isPlaying {
             self.play()
         } else {
             self.pause()
@@ -684,15 +666,15 @@ private final class HLSVideoContentNode: ASDisplayNode, UniversalVideoContentNod
             if !self.hasAudioSession {
                 self.audioSessionDisposable.set(self.audioSessionManager.push(audioSessionType: .play(mixWithOthers: false), activate: { [weak self] _ in
                     self?.hasAudioSession = true
-                    self?.player?.volume = 1.0
+                    self?.player.volume = 1.0
                 }, deactivate: { [weak self] _ in
                     self?.hasAudioSession = false
-                    self?.player?.pause()
+                    self?.player.pause()
                     return .complete()
                 }))
             }
         } else {
-            self.player?.volume = 0.0
+            self.player.volume = 0.0
             self.hasAudioSession = false
             self.audioSessionDisposable.set(nil)
         }
@@ -701,16 +683,16 @@ private final class HLSVideoContentNode: ASDisplayNode, UniversalVideoContentNod
     func seek(_ timestamp: Double) {
         assert(Queue.mainQueue().isCurrent())
         self.seekId += 1
-        self.player?.seek(to: CMTime(seconds: timestamp, preferredTimescale: 30))
+        self.player.seekTo(time: timestamp)
     }
     
     func playOnceWithSound(playAndRecord: Bool, seek: MediaPlayerSeek, actionAtEnd: MediaPlayerPlayOnceWithSoundActionAtEnd) {
-        self.player?.volume = 1.0
+        self.player.volume = 1.0
         self.play()
     }
     
     func setSoundMuted(soundMuted: Bool) {
-        self.player?.volume = soundMuted ? 0.0 : 1.0
+        self.player.volume = soundMuted ? 0.0 : 1.0
     }
     
     func continueWithOverridingAmbientMode(isAmbient: Bool) {
@@ -720,7 +702,7 @@ private final class HLSVideoContentNode: ASDisplayNode, UniversalVideoContentNod
     }
     
     func continuePlayingWithoutSound(actionAtEnd: MediaPlayerPlayOnceWithSoundActionAtEnd) {
-        self.player?.volume = 0.0
+        self.player.volume = 0.0
         self.hasAudioSession = false
         self.audioSessionDisposable.set(nil)
     }
@@ -729,52 +711,39 @@ private final class HLSVideoContentNode: ASDisplayNode, UniversalVideoContentNod
     }
     
     func setBaseRate(_ baseRate: Double) {
-        guard let player = self.player else {
-            return
-        }
-        self.baseRate = baseRate
-        if #available(iOS 16.0, *) {
-            player.defaultRate = Float(baseRate)
-        }
-        if player.rate != 0.0 {
-            player.rate = Float(baseRate)
-        }
-        self.updateStatus()
+//        self.baseRate = baseRate
+//        if #available(iOS 16.0, *) {
+//            player.defaultRate = Float(baseRate)
+//        }
+//        if player.rate != 0.0 {
+//            player.rate = Float(baseRate)
+//        }
+//        self.updateStatus()
+        updateStatus()
     }
     
     func setVideoQuality(_ videoQuality: UniversalVideoContentVideoQuality) {
         self.preferredVideoQuality = videoQuality
         
-        guard let currentItem = self.player?.currentItem else {
-            return
-        }
-        guard let playerSource = self.playerSource else {
+        guard player.isPlaying else {
             return
         }
         
         switch videoQuality {
         case .auto:
-            currentItem.preferredPeakBitRate = 0.0
+            player.setLoadingStrategy(.automatic)
         case let .quality(qualityValue):
-            if let file = playerSource.qualityFiles[qualityValue] {
-                if let size = file.media.size, let duration = file.media.duration, duration != 0.0 {
-                    let bandwidth = Int(Double(size) / duration) * 8
-                    currentItem.preferredPeakBitRate = Double(bandwidth)
-                }
-            }
+            player.setLoadingStrategy(.current(.init(bandwidth: qualityValue)))
+            break
         }
-        
     }
     
     func videoQualityState() -> (current: Int, preferred: UniversalVideoContentVideoQuality, available: [Int])? {
-        guard let currentItem = self.player?.currentItem else {
+        guard player.isPlaying else {
             return nil
         }
-        guard let playerSource = self.playerSource else {
-            return nil
-        }
-        let current = Int(currentItem.presentationSize.height)
-        var available: [Int] = Array(playerSource.qualityFiles.keys)
+        let current = Int(intrinsicDimensions.height) // Int(currentItem.presentationSize.height) TODO: get frame height
+        var available: [Int] = player.loadingOptions.map { $0.bandwidth }
         available.sort(by: { $0 > $1 })
         return (current, self.preferredVideoQuality, available)
     }
